@@ -1,0 +1,136 @@
+name: Setup Windows 
+
+on:
+  workflow_dispatch:
+
+jobs:
+  setup-windows-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
+    env:
+      RDP_USER: "xman"
+      RDP_PASS: "12341234sh@"
+      TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+
+    steps:
+      - name: Show starting message
+        run: |
+          Write-Host "Starting setup: RDP user $env:RDP_USER, installing Steam, Sandboxie-Plus, TightVNC, Tailscale"
+
+      - name: Enable Remote Desktop and relax SecurityLayer (if needed)
+        run: |
+          # Enable RDP in registry
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Optionally disable NLA (SecurityLayer) if required (0 = RDP SecurityLayer)
+          # NOTE: Disabling NLA reduces security; we apply as requested.
+          New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name "SecurityLayer" -Value 0 -PropertyType DWord -Force
+
+          # Restart RDP service to apply changes
+          Restart-Service -Name TermService -Force
+
+      - name: Configure Windows Firewall for RDP (port 3389)
+        run: |
+          # Remove old rule if exists, then add allow rule
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "no previous rule"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
+      - name: Create local user 'shamander' and add to groups
+        run: |
+          $username = $env:RDP_USER
+          $passwordPlain = $env:RDP_PASS
+
+          # Remove existing user if present (to ensure idempotence)
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+            Write-Host "User $username exists â€” removing to recreate"
+            Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
+          }
+
+          $securePass = ConvertTo-SecureString $passwordPlain -AsPlainText -Force
+          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword:$false
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+
+          # verify
+          if (-not (Get-LocalUser -Name $username)) {
+            Write-Error "User creation failed"
+            exit 1
+          }
+
+      - name: Install Steam (silent)
+        run: |
+          $steamUrl = "https://steamcdn-a.akamaihd.net/client/installer/SteamSetup.exe"
+          $installer = "$env:TEMP\SteamSetup.exe"
+          Invoke-WebRequest -Uri $steamUrl -OutFile $installer -UseBasicParsing
+          Start-Process -FilePath $installer -ArgumentList "/S" -Wait -NoNewWindow
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+      - name: Install Sandboxie-Plus (silent)
+        run: |
+          # Uses GitHub releases 'latest/download' redirect for Sandboxie-Plus x64 installer
+          $sbUrl = "https://github.com/sandboxie-plus/Sandboxie/releases/download/v1.16.3/Sandboxie-Plus-x64-v1.16.3.exe"
+          $installer = "$env:TEMP\SandboxiePlus.exe"
+          Invoke-WebRequest -Uri $sbUrl -OutFile $installer -UseBasicParsing
+          Start-Process -FilePath $installer -ArgumentList "/VERYSILENT", "/NORESTART" -Wait -NoNewWindow
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+
+      - name: Install Tailscale (MSI) and bring up with auth key
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installer -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installer`"", "/qn", "/norestart" -Wait
+          Remove-Item $installer -Force -ErrorAction SilentlyContinue
+
+          # Wait for tailscale.exe to become available
+          $tsExe = Join-Path $env:ProgramFiles "Tailscale\tailscale.exe"
+          $attempts = 0
+          while (-not (Test-Path $tsExe) -and $attempts -lt 12) {
+            Start-Sleep -Seconds 5
+            $attempts++
+          }
+          if (-not (Test-Path $tsExe)) {
+            Write-Error "Tailscale executable not found after install"
+            exit 1
+          }
+
+          # Bring Tailscale up with the provided auth key and hostname that includes run id
+          & $tsExe up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID || Write-Host "tailscale up returned non-zero (may need interactive auth)"
+
+          # Attempt to capture an IPv4 address
+          $tsIP = & $tsExe ip -4
+          if ($tsIP) {
+            echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          } else {
+            Write-Host "No Tailscale IPv4 returned yet"
+          }
+
+      - name: Verify RDP connectivity (basic)
+        run: |
+          if ($env:TAILSCALE_IP) {
+            Write-Host "Testing TCP to $env:TAILSCALE_IP:3389"
+            $res = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+            if (-not $res.TcpTestSucceeded) {
+              Write-Warning "TCP test failed to $env:TAILSCALE_IP:3389 (may still succeed from another node)"
+            } else {
+              Write-Host "TCP to RDP port successful"
+            }
+          } else {
+            Write-Host "TAILSCALE_IP not available â€” skip connectivity test"
+          }
+
+
+      - name: Maintain Connection
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+          
+          # Keep runner active indefinitely (or until manually cancelled)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
