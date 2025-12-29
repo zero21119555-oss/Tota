@@ -34,27 +34,7 @@ jobs:
           # Remove old rule if exists, then add allow rule
           netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "no previous rule"
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
-
-      - name: Create local user 'shamander' and add to groups
-        run: |
-          $username = $env:RDP_USER
-          $passwordPlain = $env:RDP_PASS
-
-          # Remove existing user if present (to ensure idempotence)
-          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-            Write-Host "User $username exists â€” removing to recreate"
-            Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
-          }
-
-          $securePass = ConvertTo-SecureString $passwordPlain -AsPlainText -Force
-          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -PasswordNeverExpires -UserMayNotChangePassword:$false
-          Add-LocalGroupMember -Group "Administrators" -Member $username
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
-
-          # verify
-          if (-not (Get-LocalUser -Name $username)) {
-            Write-Error "User creation failed"
-            exit 1
+ 1
           }
 
       - name: Install Steam (silent)
